@@ -9,23 +9,32 @@
 
 ## Overview
 
-This project takes a running AKS cluster and removes standing privileged access from it. No one holds permanent `cluster-admin`. To get into the cluster, an engineer requests access for a fixed window, passes MFA, gives a business reason and a ticket number, and waits for an approver. The access self-expires when the window closes. Every request is logged and can be alerted on.
+This lab takes a running Azure Kubernetes Service cluster and removes standing privileged access from it. No one holds permanent `cluster-admin`. To get into the cluster, an engineer requests access for one hour, passes MFA, gives a business reason and a ticket number, and waits for an approver. The access expires on its own when the window closes. Every request is logged, and privileged activations raise an alert.
 
-The design works by delegating Kubernetes authorization to Azure RBAC, then wrapping the privileged role assignments in Microsoft Entra Privileged Identity Management. The result is a privileged-access model for a cloud-native workload that an auditor can sign off on and a security team can actually operate.
+It works by delegating Kubernetes authorization to Azure RBAC, then governing the privileged role assignments with Microsoft Entra Privileged Identity Management. The outcome is a privileged-access model for a cloud-native workload that a security team can operate and an auditor can sign off on.
 
-## The problem this solves
+## The enterprise problem
 
-Most AKS clusters run on native Kubernetes RBAC, and the pattern is almost always the same: a handful of engineers get `cluster-admin`, that access never gets removed, and nothing sits between a compromised laptop and full control of every workload in the cluster. There is no approval, no expiry, no second factor at the moment of access, and no clean audit trail linking a `kubectl` command to a person and a reason.
+Standing `cluster-admin` is the default state of most AKS deployments, and it is expensive in ways that only show up during an incident or an audit.
 
-That gap is exactly what gets flagged in an access-control review (ISO 27001 A.5.15 and A.5.18) and in any serious privileged-access assessment. Standing admin on production infrastructure is a finding, not a footnote.
+A cluster running native Kubernetes RBAC usually has a handful of engineers holding permanent admin. That access never gets revoked. Nothing sits between a phished laptop and full control of every workload, secret, and namespace in the cluster. There is no second factor at the moment of access, no approval, no business reason on record, and no clean trail linking a `kubectl` command to a named person. When an attacker lands on one of those accounts, the blast radius is the entire cluster.
 
-This build closes the gap:
+For anyone doing an access-control review, this is a finding, not a footnote. It fails least-privilege, it fails privileged-access management, and it fails the logging and accountability expectations in ISO 27001, NIST 800-53, and PCI-DSS. The fix is not more policy documents. It is removing the standing access and making privilege something you check out and give back.
 
-- Nothing above read-only is permanently assigned. Privileged tiers are eligible, not active.
-- Activation requires MFA, a written justification, a ticket reference, and approval.
-- Access expires on its own after one hour.
-- Every activation is captured in the Entra audit log and surfaced through a KQL alert.
-- A recurring access review recertifies who should still be eligible.
+## Enterprise problems solved in this lab
+
+| Problem in most environments | What this lab does about it | Maps to |
+|------------------------------|-----------------------------|---------|
+| Permanent `cluster-admin` that nobody revokes | Privileged tiers are eligible only, activated for a fixed window | Least privilege, ISO 27001 A.5.15 |
+| No second factor at the point of privilege | MFA required at activation, not just at sign-in | NIST 800-53 IA-2, AC-6 |
+| Admin access granted with no approval or reason | Approval, written justification, and ticket number required to activate | Separation of duties, change control |
+| Access that never expires | One-hour cap, access removed automatically | Just-in-time access, NIST AC-2 |
+| No trail tying a `kubectl` action to a person | Every activation captured in the Entra audit log | Accountability and logging, ISO 27001 A.8.15 |
+| Eligible lists that rot as people change teams | Recurring access review recertifies who stays eligible | Periodic recertification, ISO 27001 A.5.18 |
+| No detection when privilege is used | KQL alert fires on cluster-admin activations | Continuous monitoring, NIST AU-6 |
+| A broken PIM service locks everyone out | Documented break-glass account, excluded and monitored | Operational resilience |
+
+Each row below is backed by a screenshot from the actual build, so the claims are demonstrated, not asserted.
 
 ## Architecture
 
@@ -44,56 +53,105 @@ flowchart TD
     BG[Break-glass account<br/>excluded from PIM] -.->|documented, monitored| RBAC
 ```
 
-The design decision that makes all of this possible is `--enable-azure-rbac` on the cluster. It tells AKS to hand authorization decisions to Azure RBAC instead of native Kubernetes RBAC. Once that switch is flipped, controlling who can run `kubectl` is the same as controlling Azure role assignments, and Azure role assignments are what PIM governs.
+The decision that makes the whole model possible is `--enable-azure-rbac` on the cluster. It hands authorization decisions to Azure RBAC instead of native Kubernetes RBAC. Once that is set, controlling who can run `kubectl` is the same as controlling Azure role assignments, and Azure role assignments are what PIM governs.
+
+![AKS with Entra authentication and Azure RBAC enabled](screenshots/01-aks-entra-azure-rbac-enabled.png)
+*The cluster with Microsoft Entra authentication and Azure RBAC for Kubernetes authorization both enabled. This is the foundation the rest of the controls depend on.*
 
 ## Access model
 
+Three tiers, sized to risk. Read-only stays on because it is low risk. Everything above it has to be requested.
+
 | Tier | Azure RBAC role | Scope | Access |
 |------|-----------------|-------|--------|
-| Read-only | Azure Kubernetes Service RBAC Reader | Cluster | Standing (low risk) |
+| Read-only | Azure Kubernetes Service RBAC Reader | Cluster | Standing |
 | Namespace developer | Azure Kubernetes Service RBAC Writer | Single namespace | Eligible via PIM |
 | Cluster admin | Azure Kubernetes Service RBAC Cluster Admin | Cluster | Eligible via PIM, approval required |
 
-The developer tier is scoped to one namespace rather than the whole cluster. That is a deliberate least-privilege choice, not a default, and it is the kind of decision that separates a designed access model from a copied one.
+![Entra groups and reader role assignment](screenshots/02-entra-groups-reader-assignment.png)
+*The three access groups, with the read-only role assigned to the readers group at the cluster scope.*
 
-## Two PIM patterns, on purpose
+The admin tier uses PIM for Groups. The developer tier uses PIM for Azure Resources, scoped to one namespace instead of the whole cluster. Building one of each shows both patterns and makes the tradeoff concrete: group activation is cleaner when one request should grant a bundle of access, direct resource assignment is cleaner when you want tight per-resource granularity.
 
-The admin tier uses **PIM for Groups**: membership in an admin group is eligible, and the group carries the Azure role. The developer tier uses **PIM for Azure Resources**: the role is assigned directly to the user as an eligible assignment on the cluster resource. Building one of each shows both patterns working and makes it clear when to reach for which. Group activation is cleaner when one request should grant a bundle of access. Direct resource assignment is cleaner when you want tight, per-resource granularity.
+![Admin user eligible in PIM for Groups](screenshots/03-pim-admin-eligible-group.png)
+*The admin user as an eligible member of the admin group. Eligible, not active. That distinction is the point of the whole project.*
+
+![Developer eligible assignment scoped to a namespace](screenshots/04-pim-developer-eligible-namespace-scoped.png)
+*The developer tier granted as an eligible Writer assignment scoped to a single namespace. Narrow scope by design, not by default.*
 
 ## Controls enforced at activation
 
-- MFA required at the point of activation, not just at sign-in.
-- Approval routed to a designated approver before access is granted.
-- Written business justification required.
-- Ticket number required, binding the access to a change or incident.
-- One-hour maximum, after which access is gone with no manual cleanup.
+This is where the privileged-access control set lives. Nothing gets granted without passing all of it.
+
+- MFA at the point of activation
+- Approval routed to a designated approver
+- Written business justification
+- Ticket number, binding the access to a change or incident
+- One-hour maximum, after which access is removed with no manual cleanup
+
+![Activation policy showing MFA, justification, ticket, approval, and one-hour cap](screenshots/05-activation-policy-controls.png)
+*The activation policy: MFA, justification, ticket, approval, and the one-hour limit all enforced. This single screen is what a reviewer reads as a real PAM control set.*
+
+## Recertification
+
+Eligible lists go stale. People move teams and the cleanup never happens. A recurring access review is the control that stops the list from drifting into a pile of forgotten access.
+
+![Access review configured](screenshots/06-access-review-configured.png)
+*A quarterly access review over the eligible assignments, set to remove access that goes unreviewed.*
 
 ## Proof it works
 
-The project does not stop at enabling features. It demonstrates the control denying and granting access on cue:
+Enabling a feature is not evidence. This section shows the control denying and granting access on cue, which is the difference between a portfolio piece and a screenshot of a settings page.
 
-1. With no active role, `kubectl get pods` is denied.
-2. The engineer activates through PIM, completes MFA, enters a justification and ticket, and an approver signs off.
-3. The same command now succeeds.
-4. After the window expires, the command is denied again.
-5. The activation shows up in the Entra audit log with the user, role, and timestamp.
+**Before activation,** with no active role, the command is denied:
 
-That before, during, and after sequence is the evidence that the access is genuinely temporary and genuinely controlled.
+![kubectl denied before activation](screenshots/07-kubectl-denied-before.png)
+*`kubectl get pods` refused. The user holds an eligible assignment, not an active one, so authorization fails.*
 
-## Beyond the core build
+**Activation** goes through PIM with MFA, a justification, and a ticket, then an approver signs off:
 
-- **Detection.** Entra audit logs and AKS diagnostics flow into a Log Analytics workspace, with a KQL query and alert rule that fire on cluster-admin activations. Prevention plus detection, not one or the other.
-- **Break-glass.** A documented emergency account, excluded from PIM and monitored on sign-in, so a PIM outage or a missing approver cannot lock the whole team out of the cluster. This is a real operational requirement, and leaving it out is how good designs fail on their worst day.
+![PIM activation form and approval](screenshots/08-pim-activation-approval.png)
+*The activation request with justification and ticket, and the approval from the approver account.*
+
+**After activation,** the same command works:
+
+![kubectl succeeds after activation](screenshots/09-kubectl-success-after.png)
+*The identical command now returns pods. Access was granted only after every control was satisfied.*
+
+**After expiry,** access is gone again:
+
+![kubectl denied after expiry](screenshots/10-kubectl-denied-after-expiry.png)
+*Once the one-hour window closed, the command fails again. The access was genuinely temporary, with no manual revocation needed.*
+
+**The audit trail** records who activated what, and when:
+
+![Entra audit log entry for the activation](screenshots/11-entra-audit-log-activation.png)
+*The Entra audit log entry for the activation, tying the privileged access to a named user, a role, and a timestamp.*
+
+## Detection
+
+Prevention is one layer. Detection is the second. Entra audit logs and AKS diagnostics flow into a Log Analytics workspace, and a KQL query surfaces cluster-admin activations and drives an alert rule.
+
+![KQL query and alert rule for cluster-admin activations](screenshots/12-kql-query-alert-rule.png)
+*A KQL query returning privileged activations, wired into a scheduled alert rule so the security team hears about cluster-admin use.*
+
+## Break-glass
+
+Every real PIM deployment needs an emergency account that is not subject to PIM, so an outage or a missing approver cannot lock the team out of its own cluster. This one is cloud-only, holds standing admin, is excluded from the Conditional Access that could block it, and raises an alert whenever it signs in.
+
+![Break-glass account documented](screenshots/13-break-glass-account.png)
+*The break-glass account, documented with its exclusions and its monitoring. Most lab projects skip this. In a real environment it is the thing that saves you on the worst day.*
 
 ## Skills demonstrated
 
 - Delegating Kubernetes authorization to Azure RBAC and understanding the tradeoff
 - Designing a tiered, least-privilege access model with namespace scoping
 - Operating both PIM for Groups and PIM for Azure Resources
-- Building a complete privileged-access control set: MFA, approval, justification, ticket binding, time-boxed expiry
+- Building a full privileged-access control set: MFA, approval, justification, ticket binding, time-boxed expiry
 - Access reviews for periodic recertification
 - Detection engineering with Log Analytics, KQL, and Sentinel
 - Break-glass design for operational resilience
+- Mapping technical controls to ISO 27001, NIST 800-53, and PCI-DSS expectations
 
 ## Related Resources
 
@@ -112,7 +170,7 @@ IAM/PAM Engineer | CyberArk Specialist | Zero Trust Architect
 
 ## Conclusion
 
-Standing privileged access is one of the easiest things to hand out and one of the hardest to walk back. This project shows a working alternative: privileged access to a Kubernetes cluster that has to be requested, approved, justified, and given up again, with the whole thing logged. It is the kind of control that shrinks the attack surface without slowing engineers down, and it maps directly to what auditors and security teams ask for.
+Standing privileged access is easy to hand out and hard to walk back. This lab shows the alternative in a working state: admin access to a Kubernetes cluster that has to be requested, approved, justified, and given up again, with the whole thing logged and monitored. It shrinks the attack surface without getting in the engineer's way, and it answers the exact questions an auditor and a security team bring to a privileged-access review.
 
 Thank you.
 
