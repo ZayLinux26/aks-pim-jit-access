@@ -8,13 +8,23 @@
 ![Log Analytics](https://img.shields.io/badge/Log_Analytics_+_KQL-0078D4?style=for-the-badge&logo=microsoftazure&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-brightgreen?style=for-the-badge)
 
-## Overview
+## What this is
 
-This lab takes a running Azure Kubernetes Service cluster and removes standing privileged access from it. No one holds permanent `cluster-admin`. To get into the cluster, an engineer requests access for one hour, passes MFA, gives a business reason and a ticket number, and waits for an approver. The access expires on its own when the window closes. Every request is logged, and privileged activations raise an alert.
+A working privileged-access model for an Azure Kubernetes Service cluster where no one holds permanent `cluster-admin`. Access to the cluster has to be requested for one hour, cleared through MFA and an approver, tied to a business reason and a ticket, and it expires on its own. Every activation is logged, streamed to Log Analytics, and alerted on. An emergency break-glass account covers the one failure mode this design introduces.
 
-It works by delegating Kubernetes authorization to Azure RBAC, then governing the privileged role assignments with Microsoft Entra Privileged Identity Management. The outcome is a privileged-access model for a cloud-native workload that a security team can operate and an auditor can sign off on.
+The result removes the single most abused form of standing privilege in a cloud-native environment, and it does so in a way an auditor can sign off on and a security team can run.
 
-This README documents both the build and the failures. The build is the design. The failures are where the real learning was, and they are written up in full below, because a project that never broke is usually a project that was never actually exercised.
+## At a glance
+
+| | |
+|---|---|
+| **Risk removed** | Standing `cluster-admin`, the permanent keys-to-the-cluster that survive a compromised laptop |
+| **How** | Kubernetes authorization delegated to Azure RBAC, then governed by Entra PIM |
+| **Controls** | MFA on activation, approval, justification, ticket binding, one-hour expiry |
+| **Detection** | Entra audit logs to Log Analytics, KQL alert on cluster-admin activation |
+| **Resilience** | Documented break-glass account outside PIM, monitored on sign-in |
+| **Proven** | Access denied, activated, allowed, expired, and audited, with evidence for each step |
+| **Maps to** | ISO 27001, NIST 800-53, PCI-DSS access-control and logging expectations |
 
 ## The enterprise problem
 
@@ -24,9 +34,9 @@ A cluster running native Kubernetes RBAC usually has a handful of engineers hold
 
 For anyone doing an access-control review, this is a finding, not a footnote. It fails least-privilege, it fails privileged-access management, and it fails the logging and accountability expectations in ISO 27001, NIST 800-53, and PCI-DSS. The fix is not more policy documents. It is removing the standing access and making privilege something you check out and give back.
 
-## Enterprise problems solved in this lab
+## Enterprise problems solved
 
-| Problem in most environments | What this lab does about it | Maps to |
+| Problem in most environments | What this project does about it | Maps to |
 |------------------------------|-----------------------------|---------|
 | Permanent `cluster-admin` that nobody revokes | Privileged tiers are eligible only, activated for a fixed window | Least privilege, ISO 27001 A.5.15 |
 | No second factor at the point of privilege | MFA required at activation, not just at sign-in | NIST 800-53 IA-2, AC-6 |
@@ -37,7 +47,7 @@ For anyone doing an access-control review, this is a finding, not a footnote. It
 | No detection when privilege is used | KQL alert fires on cluster-admin activations | Continuous monitoring, NIST AU-6 |
 | A broken PIM service locks everyone out | Documented break-glass account, excluded and monitored | Operational resilience |
 
-Each row below is backed by a screenshot from the actual build, so the claims are demonstrated, not asserted.
+Every row is backed by a screenshot from the actual build, so the claims are demonstrated, not asserted.
 
 ## Architecture
 
@@ -128,7 +138,7 @@ Enabling a feature is not evidence. This section shows the control denying and g
 
 **The audit trail** records who activated what, and when:
 
-![Entra audit log entry for the activation](screenshots/11-entra-audit-log-activation.png)
+![PIM resource audit entry for the activation](screenshots/11-entra-audit-log-activation.png)
 *The PIM resource audit entry for the activation, tying the privileged access to a named user, a role, and a timestamp.*
 
 ## Detection
@@ -137,24 +147,30 @@ Prevention is one layer. Detection is the second. Entra audit logs and AKS diagn
 
 ```kql
 AuditLogs
-| where TimeGenerated > ago(24h)
+| where TimeGenerated > ago(1h)
 | where LoggedByService == "PIM"
+| where OperationName == "Add member to role completed (PIM activation)"
 | where Result == "success"
-| project TimeGenerated, OperationName,
+| project TimeGenerated,
+    OperationName,
     InitiatedByUser = tostring(InitiatedBy.user.userPrincipalName),
-    TargetResource = tostring(TargetResources[0].displayName)
+    TargetGroup = tostring(TargetResources[0].displayName)
 | order by TimeGenerated desc
 ```
 
-![KQL query and alert rule for cluster-admin activations](screenshots/12-kql-query-alert-rule.png)
-*A KQL query returning privileged activations, wired into a scheduled alert rule so the security team hears about cluster-admin use.*
+Filtering on the completed operation means the alert fires once per real activation, not once for the request and again for the completion.
+
+![KQL query returning a cluster-admin activation, wired to an alert rule](screenshots/12-kql-query-alert-rule.png)
+*The query returning a live PIM activation from the workspace, turned into a scheduled alert rule so the security team hears about cluster-admin use within minutes.*
 
 ## Break-glass
 
-Every real PIM deployment needs an emergency account that is not subject to PIM, so an outage or a missing approver cannot lock the team out of its own cluster. This one is cloud-only, holds standing admin, is excluded from the Conditional Access that could block it, and raises an alert whenever it signs in.
+Removing standing access introduces one failure mode: if PIM is down, an approver is locked out, or MFA breaks, nobody can activate `cluster-admin`. The break-glass account is the deliberate exception that covers it. It is cloud-only, holds standing Cluster Admin on the cluster, sits outside PIM, is excluded from any Conditional Access that could block it, and raises an alert whenever it signs in.
+
+Full procedure, exclusions, credential handling, and monitoring are documented in [break-glass-runbook.md](break-glass-runbook.md).
 
 ![Break-glass account documented](screenshots/13-break-glass-account.png)
-*The break-glass account, documented with its exclusions and its monitoring. Most lab projects skip this. In a real environment it is the thing that saves you on the worst day.*
+*The break-glass account with standing Cluster Admin, kept outside PIM on purpose, backed by a written runbook. Most lab projects skip this. In a real environment it is the thing that saves you on the worst day.*
 
 ## What broke and how I fixed it
 
@@ -162,25 +178,25 @@ Every step below failed at least once. I am keeping the failures in because work
 
 ### Getting the cluster built
 
-**Azure Policy blocked the cluster from deploying.** The first `az aks create` was denied outright with `RequestDisallowedByPolicy`, from an "Allowed resource types" rule inside a governance initiative already assigned to the subscription. AKS is not a single resource. Creating a cluster provisions a whole set of supporting types (a VM scale set, a load balancer, a public IP), and the initiative only permitted an allow-list. One disallowed type kills the entire create. I fixed it with a scoped policy exemption rather than removing the control, which is the auditable way to handle a legitimate exception.
+**Azure Policy blocked the cluster from deploying.** The first `az aks create` was denied outright with `RequestDisallowedByPolicy`, from an "Allowed resource types" rule inside a governance initiative already on the subscription. AKS is not a single resource. Creating a cluster provisions a set of supporting types (a VM scale set, a load balancer, a public IP), and the initiative only permitted an allow-list. One disallowed type kills the entire create. I fixed it with a scoped policy exemption rather than removing the control, which is the auditable way to handle a legitimate exception.
 
 *Lesson: a governance control blocking your own deployment is the control working. The professional move is a documented, scoped waiver, not tearing the policy down.*
 
-**The exemption was scoped to the wrong resource group.** I first scoped the exemption to `rg-aks-pim`, the group I created. The next create still failed, but the block had moved to `MC_rg-aks-pim_aks-pim-lab_eastus`. AKS auto-creates a second resource group, the node resource group, to hold the cluster's infrastructure, and that group does not exist until the cluster deploys, so I could not pre-exempt it directly. The answer was to scope the exemption one level up, at the subscription, so it covered both the cluster group and the node group.
+**The exemption was scoped to the wrong resource group.** I first scoped it to `rg-aks-pim`, the group I created. The next create still failed, but the block had moved to `MC_rg-aks-pim_aks-pim-lab_eastus`. AKS auto-creates a second resource group, the node resource group, for the cluster's infrastructure, and it does not exist until the cluster deploys, so I could not pre-exempt it. The answer was to scope the exemption at the subscription, covering both groups.
 
 *Lesson: AKS provisions into a resource group you do not directly manage. Governance scoped at the wrong level will block the deploy in a place you cannot target ahead of time.*
 
-**A half-built cluster after the policy-killed deploy.** Because the create failed partway through, a cluster object existed but its control plane never finished provisioning. `az aks create` then reported the cluster "already exists," while `az aks get-credentials` returned `ControlPlaneNotFound`. There is no clean repair for that state. I deleted the broken cluster and the leftover node resource group, confirmed the exemption was live, and rebuilt from nothing.
+**A half-built cluster after the policy-killed deploy.** Because the create failed partway, a cluster object existed but its control plane never finished. `az aks create` then reported "already exists" while `az aks get-credentials` returned `ControlPlaneNotFound`. There is no clean repair for that state. I deleted the broken cluster and the leftover node resource group, confirmed the exemption was live, and rebuilt from nothing.
 
 *Lesson: a partial deploy leaves a broken object behind. Delete and rebuild rather than trying to reconcile it.*
 
 ### Getting identity and access right
 
-**A guest account that would not resolve by email.** Assigning a role with `--assignee` and my sign-in email failed with "Cannot find user or service principal in graph database." My account is a guest (external) identity in the tenant, so its real UPN carries the `#EXT#` form and the plain email does not resolve. I looked the account up by display name to get its object ID, then assigned the role by object ID instead of email.
+**A guest account that would not resolve by email.** Assigning a role with `--assignee` and my sign-in email failed with "Cannot find user or service principal in graph database." My account is a guest (external) identity in the tenant, so its real UPN carries the `#EXT#` form and the plain email does not resolve. I looked the account up by display name to get its object ID, then assigned by object ID.
 
 *Lesson: external and guest identities do not resolve by their outside email in role assignments. Use the object ID.*
 
-**The developer Writer role landed on the resource group, not a namespace.** The namespace-scoped developer tier was denied on every `kubectl` command. Listing the role assignments and their scopes showed the Writer role scoped to `rg-aks-pim`, the resource group, not to a namespace on the cluster. A resource-group-scoped Writer grants no working Kubernetes authorization. The correct scope is the cluster resource path plus `/namespaces/<name>`.
+**The developer Writer role landed on the resource group, not a namespace.** The namespace-scoped developer tier was denied on every `kubectl` command. Listing the role assignments showed the Writer role scoped to `rg-aks-pim`, the resource group, not a namespace on the cluster. A resource-group-scoped Writer grants no working Kubernetes authorization. The correct scope is the cluster resource path plus `/namespaces/<name>`.
 
 *Lesson: AKS namespace scoping has to target the cluster resource, not the resource group that contains it.*
 
@@ -188,27 +204,27 @@ Every step below failed at least once. I am keeping the failures in because work
 
 *Lesson: standing access accumulates quietly. Finding and converting a permanent admin membership to eligible-only is the model correcting itself, which is what a real PAM review produces.*
 
-**Self-approval dead-ended the activation.** With the requester and the approver set to the same account, the activation went to "pending approval" and never surfaced in that account's Approve requests queue, so there was no way to clear it. One identity cannot satisfy both sides of a separation-of-duties control. I resolved it for the lab by adjusting the approver configuration; in production the approver is a different person by design.
+**Self-approval dead-ended the activation.** With the requester and approver set to the same account, the activation went to "pending approval" and never surfaced in that account's Approve requests queue, so it could not be cleared. One identity cannot satisfy both sides of a separation-of-duties control. I resolved it for the lab by adjusting the approver configuration; in production the approver is a different person by design.
 
 *Lesson: separation of duties is not just policy language. The tooling enforces it, and a single-identity setup cannot demonstrate an approval control honestly.*
 
 ### Getting monitoring to work
 
-**The diagnostic setting failed because the destination did not exist.** Wiring Entra audit logs to Log Analytics threw `LinkedAuthorizationFailed` with a complaint that `properties.workspaceId` had an invalid type. The real cause was simpler than the error: there was no Log Analytics workspace in the subscription yet, so the setting was trying to write an empty destination. I created the workspace first, then pointed diagnostics at it.
+**The diagnostic setting failed because the destination did not exist.** Wiring Entra audit logs to Log Analytics threw `LinkedAuthorizationFailed` complaining that `properties.workspaceId` had an invalid type. The real cause was simpler than the error: there was no Log Analytics workspace yet, so the setting was writing an empty destination. I created the workspace first, then pointed diagnostics at it.
 
 *Lesson: read past the error text to the state. "Invalid workspaceId" meant "there is no workspace," not "the value is malformed."*
 
-**The Entra audit stream was never actually enabled.** After setting up AKS diagnostics, I almost stopped there. Checking the Entra side showed no diagnostic setting for `AuditLogs` at all. This matters because PIM activation events come from the Entra audit stream, not the AKS one. Without it, the KQL alert on cluster-admin activations would have queried an empty table forever, and the detection layer would have looked done while doing nothing. I added the missing Entra `AuditLogs` setting pointing at the same workspace.
+**The Entra audit stream was never actually enabled.** After setting up AKS diagnostics, I almost stopped there. Checking the Entra side showed no diagnostic setting for `AuditLogs` at all. This matters because PIM activation events come from the Entra audit stream, not the AKS one. Without it, the KQL alert would have queried an empty table forever, and the detection layer would have looked done while doing nothing. I added the missing Entra `AuditLogs` setting.
 
 *Lesson: verify each log source at its source. A monitoring pipeline that looks configured can still be silently missing the one stream that carries the events you care about.*
 
-**Audit events age out.** The original activation events were gone by the time I went back for the audit screenshot, because directory audit retention on this tier is short. Nothing recovers an event past retention. The fix going forward is exactly the Log Analytics pipeline above, which retains what the native log drops.
+**Audit events age out.** The original activation events were gone by the time I went back for the audit screenshot, because directory audit retention on this tier is short. Nothing recovers an event past retention. The fix going forward is the Log Analytics pipeline above, which retains what the native log drops.
 
 *Lesson: capture evidence in the same session you generate it, and stream logs to a workspace if you need them to survive.*
 
 ### Note on the final proof
 
-The design of this lab is PIM-governed: eligible assignments, an activation policy, and approval, all shown in the screenshots above. The final cluster-admin confirmation (Screenshot 9) was applied as a direct Azure role assignment to get a clean, same-identity before-and-after against the cluster. The just-in-time control set is demonstrated by the PIM configuration and activation evidence. The direct grant is only the last step that proved authorization end to end at the `kubectl` level, and it was removed after capture so no standing admin remains.
+The design of this project is PIM-governed: eligible assignments, an activation policy, and approval, all shown in the screenshots above. The final cluster-admin confirmation (Screenshot 9) was applied as a direct Azure role assignment to get a clean, same-identity before-and-after against the cluster. The just-in-time control set is demonstrated by the PIM configuration and activation evidence. The direct grant was only the last step that proved authorization end to end at the `kubectl` level, and it was removed after capture so no standing admin remains on any account except the documented break-glass account.
 
 ## Skills demonstrated
 
@@ -221,6 +237,12 @@ The design of this lab is PIM-governed: eligible assignments, an activation poli
 - Break-glass design for operational resilience
 - Mapping technical controls to ISO 27001, NIST 800-53, and PCI-DSS expectations
 - Diagnosing and resolving real deployment failures: Azure Policy conflicts, node resource group scoping, guest-identity role assignment, RBAC scope errors, standing-access cleanup, and diagnostic pipeline gaps
+
+## Repository contents
+
+- `README.md` — this document
+- `break-glass-runbook.md` — the emergency-access account runbook
+- `screenshots/` — evidence, numbered 01 through 13, matched to the sections above
 
 ## Related Resources
 
@@ -239,9 +261,9 @@ IAM/PAM Engineer | CyberArk Specialist | Zero Trust Architect
 
 ## Conclusion
 
-Standing privileged access is easy to hand out and hard to walk back. This lab shows the alternative in a working state: admin access to a Kubernetes cluster that has to be requested, approved, justified, and given up again, with the whole thing logged and monitored. It shrinks the attack surface without getting in the engineer's way, and it answers the exact questions an auditor and a security team bring to a privileged-access review.
+Standing privileged access is easy to hand out and hard to walk back. This project shows the alternative in a working state: admin access to a Kubernetes cluster that has to be requested, approved, justified, and given up again, with the whole thing logged, monitored, and backed by a documented emergency path.
 
-The build broke repeatedly, and every break is documented above. That is the point. Anyone can follow a happy path. Diagnosing a policy conflict, a scoping error, a hidden standing assignment, and a silent gap in a logging pipeline, then fixing each one, is the actual job.
+The build broke repeatedly, and every break is written up above. That is the point. Anyone can follow a happy path. Diagnosing a policy conflict, a scoping error, a hidden standing assignment, and a silent gap in a logging pipeline, then fixing each one, is the actual job, and it is what this project proves I can do.
 
 Thank you.
 
